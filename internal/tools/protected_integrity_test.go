@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,8 +188,12 @@ func TestProtectedIntegrityNewTestFileDoesNotBreakCurrentLoop(t *testing.T) {
 	r := New(root)
 
 	// First run: no *_test.go exists yet, nothing is tracked.
-	if _, violated := r.verifyProtectedIntegrity(r.snapshotProtectedFiles()); violated {
-		t.Fatal("empty project snapshot should track nothing")
+	snap0, snapErr := r.snapshotProtectedFiles()
+	if snapErr != nil {
+		t.Fatalf("snapshot of empty project must succeed: %v", snapErr)
+	}
+	if _, violated, verifyErr := r.verifyProtectedIntegrity(snap0); verifyErr != nil || violated {
+		t.Fatalf("empty project snapshot should track nothing (violated=%v err=%v)", violated, verifyErr)
 	}
 
 	// Agent legitimately creates its first Go test file via exec.
@@ -226,5 +231,138 @@ func TestAssertOutputProtectedIntegrityGuard(t *testing.T) {
 	good := r.AssertOutput("echo hello", "hello")
 	if !good.OK || good.Status != "PASS" {
 		t.Fatalf("legitimate assert_output must keep working, got %+v", good)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR-S1c C2 regression tests: unrestricted-depth scanning, creation
+// detection at registered paths, fail-closed on scan errors.
+// ---------------------------------------------------------------------------
+
+func TestC2DeepNewTestFileTrackedOnNextCommand(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, "main.go", "package main\n\nfunc main() {}\n")
+	r := New(root)
+
+	// Command 1 creates a *_test.go far below the old depth limits.
+	first := r.Exec("mkdir -p a/b/c/d/e/f/g/h && printf 'package h\\n' > a/b/c/d/e/f/g/h/deep_test.go")
+	if !first.OK {
+		t.Fatalf("initial creation of a new test file must stay allowed: %+v", first)
+	}
+
+	// The pre-scan of the NEXT command has no depth limit, so the deep file
+	// is tracked now. Tampering with it must FAIL.
+	second := r.Exec("echo tampered > a/b/c/d/e/f/g/h/deep_test.go")
+	if second.OK || second.Status != "FAIL" || second.Exit == 0 {
+		t.Fatalf("deep *_test.go modification must be detected, got %+v", second)
+	}
+
+	// Deletion too.
+	del := r.Exec("rm a/b/c/d/e/f/g/h/deep_test.go")
+	if del.OK || del.Status != "FAIL" {
+		t.Fatalf("deep *_test.go deletion must be detected, got %+v", del)
+	}
+}
+
+func TestC2CreationAtRegisteredProtectedPathDetected(t *testing.T) {
+	root := t.TempDir()
+	r := New(root) // ProtectedPath registry contains "test.pl"; file absent
+
+	snap, err := r.snapshotProtectedFiles()
+	if err != nil {
+		t.Fatalf("snapshot must succeed on empty project: %v", err)
+	}
+	if e, ok := snap["test.pl"]; !ok || !e.missing {
+		t.Fatalf("absent registered path must be tracked as missing entry, got %+v ok=%v", e, ok)
+	}
+
+	// Indirect creation through shell indirection (pre-check cannot see it).
+	res := r.Exec("f=test${EMPTY}.pl; echo hacked > $f")
+	if res.OK || res.Status != "FAIL" || res.Exit == 0 {
+		t.Fatalf("creation of previously-missing test.pl must FAIL, got %+v", res)
+	}
+}
+
+func TestC2PreScanFailureBlocksCommand(t *testing.T) {
+	root := t.TempDir()
+	r := New(root)
+	// A dangling symlink named test.pl makes the protected scan unresolvable.
+	// snapshotProtectedFiles must return an error and Exec must refuse to run
+	// the command at all (fail-closed, never PASS).
+	if err := os.Symlink(filepath.Join(root, "nonexistent-target"), filepath.Join(root, "test.pl")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.snapshotProtectedFiles(); err == nil {
+		t.Fatal("dangling protected symlink must produce a snapshot error")
+	}
+	victim := filepath.Join(root, "victim.txt")
+	res := r.Exec("echo ran > victim.txt")
+	if res.OK || res.Status != "FAIL" || res.Exit == 0 {
+		t.Fatalf("Exec must fail closed when pre-scan fails, got %+v", res)
+	}
+	if _, err := os.Stat(victim); !os.IsNotExist(err) {
+		t.Fatal("command must NOT have executed on host when pre-scan failed")
+	}
+}
+
+func TestC2PostScanFailureCannotReturnPass(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, "solution_test.go", "package solution\n")
+	r := New(root)
+
+	snap, err := r.snapshotProtectedFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate post-scan failure: replace the tracked file with a dangling
+	// symlink after the command would have finished — verify must return err.
+	os.Remove(filepath.Join(root, "solution_test.go"))
+	if err := os.Symlink(filepath.Join(root, "gone"), filepath.Join(root, "solution_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	modified, violated, verr := r.verifyProtectedIntegrity(snap)
+	if verr == nil && !violated {
+		t.Fatalf("unverifiable protected state must not look clean (modified=%q violated=%v err=%v)", modified, violated, verr)
+	}
+	// And the mapped Result can never read as success:
+	res := protectedScanFailure("exec", "cmd", fmt.Errorf("simulated scan failure"), "PASS\nall tests green")
+	if res.OK || res.Status != "FAIL" || res.Exit == 0 {
+		t.Fatalf("scan-failure result must be unambiguous FAIL: %+v", res)
+	}
+	if strings.Contains(res.Output, "all tests green") || strings.Contains(res.Output, "PASS") {
+		t.Fatalf("Output must not carry success markers, got %q", res.Output)
+	}
+}
+
+func TestC2WalkErrorIsFailClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions; unreadable-dir probe unreliable")
+	}
+	root := t.TempDir()
+	hidden := filepath.Join(root, "hidden")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeProjectFile(t, hidden, "x_test.go", "package x\n")
+	if err := os.Chmod(hidden, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(hidden, 0o755)
+
+	r := New(root)
+	if _, err := r.protectedIntegrityPaths(); err == nil {
+		t.Fatal("unreadable directory must produce a scan error (fail-closed), not silent skip")
+	}
+}
+
+func TestC2ModificationAndDeletionOfExistingFileStillDetected(t *testing.T) {
+	root := t.TempDir()
+	writeProjectFile(t, root, "test.pl", "say 1;\n")
+	r := New(root)
+
+	mod := r.Exec("f=$(ls te*t.pl); echo hacked >> $f")
+	if mod.OK || mod.Status != "FAIL" {
+		t.Fatalf("glob-modification of test.pl must FAIL, got %+v", mod)
 	}
 }

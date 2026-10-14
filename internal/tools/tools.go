@@ -460,8 +460,18 @@ func (r *Router) Exec(command string) Result {
 	// SEC-2: shell-level pre-checks cannot reliably follow $var, ${var},
 	// globs or symlinks, so snapshot protected files before execution and
 	// verify integrity afterwards. This is report-only: nothing is deleted
-	// or restored here.
-	protectedSnapshot := r.snapshotProtectedFiles()
+	// or restored here. Fail-closed: if the pre-scan itself fails we cannot
+	// certify what is protected, so the command does not run at all.
+	protectedSnapshot, snapErr := r.snapshotProtectedFiles()
+	if snapErr != nil {
+		return Result{
+			Tool:   "exec",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command was not executed", snapErr),
+			Error:  fmt.Sprintf("protected file pre-scan failed: %v", snapErr),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
 
 	// PR-S1: when the sandbox toggle is on, the command runs ONLY inside a
 	// rootless Podman container. Fail-closed: if podman is missing or the
@@ -476,7 +486,19 @@ func (r *Router) Exec(command string) Result {
 
 	out, err := cmd.CombinedOutput()
 
-	if modified, violated := r.verifyProtectedIntegrity(protectedSnapshot); violated {
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(protectedSnapshot)
+	if verifyErr != nil {
+		// Post-scan failure must never be reported as success, even when the
+		// command exited 0 and printed PASS.
+		return Result{
+			Tool:   "exec",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command output moved to Error field", verifyErr),
+			Error:  fmt.Sprintf("post-execution protected scan failed: %v. original output follows:\n%s", verifyErr, string(out)),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+	if violated {
 		return protectedIntegrityFailure("exec", command, modified, string(out))
 	}
 
@@ -525,7 +547,17 @@ func (r *Router) AssertOutput(command, expected string) Result {
 
 	// SEC-2: post-execution integrity guard (see Router.Exec). Snapshot
 	// before, verify after; report-only, no automatic deletion or restore.
-	protectedSnapshot := r.snapshotProtectedFiles()
+	// Fail-closed on any scan error — see Router.Exec for the rationale.
+	protectedSnapshot, snapErr := r.snapshotProtectedFiles()
+	if snapErr != nil {
+		return Result{
+			Tool:   "assert_output",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command was not executed", snapErr),
+			Error:  fmt.Sprintf("protected file pre-scan failed: %v", snapErr),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
 
 	// PR-S1: identical sandbox policy as Exec — fail-closed, no host fallback.
 	if sandboxEnabled() {
@@ -538,7 +570,17 @@ func (r *Router) AssertOutput(command, expected string) Result {
 	out, err := cmd.CombinedOutput()
 	actual := string(out)
 
-	if modified, violated := r.verifyProtectedIntegrity(protectedSnapshot); violated {
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(protectedSnapshot)
+	if verifyErr != nil {
+		return Result{
+			Tool:   "assert_output",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command output moved to Error field", verifyErr),
+			Error:  fmt.Sprintf("post-execution protected scan failed: %v. original output follows:\n%s", verifyErr, actual),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+	if violated {
 		return protectedIntegrityFailure("assert_output", command, modified, actual)
 	}
 

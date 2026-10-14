@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -103,7 +104,27 @@ func (e *sandboxLaunchError) Error() string {
 // sandboxArgsFor builds the exact argv passed to podman, including the
 // trailing shell command. Split out so tests can assert the security flags
 // without requiring podman in the environment.
+//
+// Mount topology (PR-S1 audit-fix):
+//   - exactly ONE bind of the project root into /workspace, read-write;
+//   - for every EXISTING protected file (test.pl, *_test.go, ProtectedPath
+//     registry) an additional nested RO bind at its precise container path
+//     /workspace/<rel>. Nested binds over a parent bind are standard kernel
+//     mount behaviour: reads see the same inode as the host, writes/unlinks
+//     fail with EROFS. Intermediate directories of the rel path exist inside
+//     the container because they are part of the parent rw bind, so no
+//     auto-created-mount-point problem arises.
+//   - NO second mount onto /workspace itself (the previously audited
+//     tmpfs-over-bind scheme was undefined behaviour and is removed).
+//
+// stagingDir is an optional directory holding pre-copied protected files;
+// when empty, the original host paths are bound directly read-only (kernel
+// semantics make that sufficient; copying would only add staleness risk).
 func sandboxArgsFor(root, command string) []string {
+	return sandboxArgsForWithMounts(root, command, nil)
+}
+
+func sandboxArgsForWithMounts(root, command string, protected []string) []string {
 	base := []string{
 		"run", "--rm",
 		"--network=none",
@@ -112,7 +133,16 @@ func sandboxArgsFor(root, command string) []string {
 		"--memory", sandboxMemoryLimit,
 		"--cpus", sandboxCPUQuota,
 		"--pids-limit", sandboxPidsLimit,
+		// single RW bind of the whole project root
 		"--mount", fmt.Sprintf("type=bind,src=%s,dst=%s", root, sandboxContainerPath),
+	}
+	// nested RO binds for existing protected files, by precise path
+	for _, rel := range protected {
+		host := filepath.Join(root, rel)
+		dst := sandboxContainerPath + "/" + filepath.ToSlash(rel)
+		base = append(base, "--mount", fmt.Sprintf("type=bind,src=%s,dst=%s,ro", host, dst))
+	}
+	base = append(base,
 		"--workdir", sandboxContainerPath,
 		"--env", "PATH=/usr/local/bin:/usr/bin:/bin",
 		"--cap-drop", "ALL",
@@ -120,8 +150,74 @@ func sandboxArgsFor(root, command string) []string {
 		"--label", "bratan-sandbox=1",
 		sandboxImage(),
 		"sh", "-c", command,
-	}
+	)
 	return base
+}
+
+// collectSandboxProtectedFiles lists protected files that currently EXIST
+// under r.Root, resolved through symlinks, at arbitrary depth. It combines
+// the SEC-2 snapshot set (ProtectedPath registry + depth-limited walk) with
+// an additional unrestricted-depth *_test.go / test.pl scan: the sandbox may
+// protect MORE files than SEC-2 snapshots, but never fewer, so a command can
+// no longer write to a deep existing *_test.go that the depth-limited walk
+// missed. Absent files are skipped (nothing to mount; SEC-2 post-exec guard
+// still detects their creation). A per-file stat/symlink-resolution failure
+// is treated as fail-closed via error.
+func (r *Router) collectSandboxProtectedFiles() ([]string, error) {
+	candidates := map[string]bool{}
+	base, err := r.protectedIntegrityPaths()
+	if err != nil {
+		return nil, err // fail-closed: SEC-2 scan itself failed
+	}
+	for _, rel := range base {
+		candidates[rel] = true
+	}
+
+	// protectedIntegrityPaths already performs an unrestricted-depth walk,
+	// so no second depth-limited scan is needed here.
+
+	var out []string
+	for rel := range candidates {
+		host := filepath.Join(r.Root, rel)
+
+		// Lstat first: a dangling symlink under the protected set is a
+		// fail-closed condition (we cannot prove what it points to).
+		lfi, lerr := os.Lstat(host)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				continue // absent: nothing to protect preemptively
+			}
+			return nil, fmt.Errorf("cannot stat protected file %s: %w", rel, lerr)
+		}
+
+		fi, err := os.Stat(host) // follows symlinks
+		if err != nil {
+			if os.IsNotExist(err) && lfi.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("dangling protected symlink %s: refusing to start sandbox", rel)
+			}
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("cannot stat protected file %s: %w", rel, err)
+		}
+		if !fi.Mode().IsRegular() {
+			continue
+		}
+		// resolve symlink target INSIDE root; targets outside root cannot be
+		// mounted meaningfully (they don't exist in the container namespace)
+		// — skip mounting them but keep SEC-2 coverage.
+		resolved, rerr := filepath.EvalSymlinks(host)
+		if rerr != nil {
+			return nil, fmt.Errorf("cannot resolve protected symlink %s: %w", rel, rerr)
+		}
+		absRoot, _ := filepath.Abs(r.Root)
+		if !strings.HasPrefix(resolved, absRoot+string(os.PathSeparator)) && resolved != absRoot {
+			continue // escapes root: not mountable here; SEC-2 covers it
+		}
+		out = append(out, rel)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // execSandboxed runs the command through the Podman sandbox and maps the
@@ -140,7 +236,11 @@ func (r *Router) execSandboxed(tool, command string, snapshot map[string]protect
 		return sandboxFailResult(tool, command, launchErr.Error())
 	}
 
-	if modified, violated := r.verifyProtectedIntegrity(snapshot); violated {
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(snapshot)
+	if verifyErr != nil {
+		return protectedScanFailure(tool, command, verifyErr, out)
+	}
+	if violated {
 		return protectedIntegrityFailure(tool, command, modified, out)
 	}
 
@@ -173,7 +273,11 @@ func (r *Router) assertOutputSandboxed(command, expected string, snapshot map[st
 		return sandboxFailResult(tool, command, launchErr.Error())
 	}
 
-	if modified, violated := r.verifyProtectedIntegrity(snapshot); violated {
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(snapshot)
+	if verifyErr != nil {
+		return protectedScanFailure(tool, command, verifyErr, out)
+	}
+	if violated {
 		return protectedIntegrityFailure(tool, command, modified, out)
 	}
 
@@ -233,6 +337,34 @@ func sandboxFailResult(tool, command, reason string) Result {
 // possible for short-lived --rm containers, so instead the argv is
 // self-verified before launch via ensureSandboxPolicy and any podman/runtime
 // startup failure marker in the output is treated as fail-closed.
+
+// sandboxRequiredFlags is the single source of truth for mandatory podman
+// restrictions, shared by ensureSandboxPolicy and its unit tests.
+var sandboxRequiredFlags = []string{"--network=none", "--read-only", "--memory", "--cpus", "--pids-limit"}
+
+// policyAcceptsArgs applies the exact flag-presence semantics of
+// ensureSandboxPolicy to a pre-built argv (used by tests that mutate the
+// real builder output rather than hand-written fixtures).
+func policyAcceptsArgs(argv []string) bool {
+	joined := strings.Join(argv, " ")
+	for _, flag := range sandboxRequiredFlags {
+		if !strings.Contains(joined, flag) {
+			return false
+		}
+	}
+	return true
+}
+
+// verifySandboxMountClause is the bind-mount half of ensureSandboxPolicy,
+// extracted so tests can feed it argv built for a different root.
+func verifySandboxMountClause(argv []string, root string) error {
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--mount type=bind,src="+root+",dst="+sandboxContainerPath) {
+		return fmt.Errorf("project root is not bind-mounted as the only writable mount")
+	}
+	return nil
+}
+
 func (r *Router) runSandboxedShell(tool string, command string) (output string, procErr error, launchErr *sandboxLaunchError) {
 	podmanPath, err := exec.LookPath("podman")
 	if err != nil {
@@ -250,12 +382,16 @@ func (r *Router) runSandboxedShell(tool string, command string) (output string, 
 		return "", nil, &sandboxLaunchError{stage: "start-failed", detail: "project root is not a directory: " + root}
 	}
 
+	protected, collErr := r.collectSandboxProtectedFiles()
+	if collErr != nil {
+		return "", nil, &sandboxLaunchError{stage: "start-failed", detail: collErr.Error()}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), sandboxTimeout())
 	defer cancel()
 
-	args := sandboxArgsFor(root, command)
+	args := sandboxArgsForWithMounts(root, command, protected)
 	cmd := exec.CommandContext(ctx, podmanPath, args...)
-
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -300,15 +436,14 @@ func (r *Router) runSandboxedShell(tool string, command string) (output string, 
 // contains every mandatory restriction. Used as a self-test of policy and by
 // unit tests; called once before first launch through ensureSandboxPolicy.
 func ensureSandboxPolicy(root, command string) *sandboxLaunchError {
-	required := []string{"--network=none", "--read-only", "--memory", "--cpus", "--pids-limit"}
 	joined := strings.Join(sandboxArgsFor(root, command), " ")
-	for _, flag := range required {
+	for _, flag := range sandboxRequiredFlags {
 		if !strings.Contains(joined, flag) {
 			return &sandboxLaunchError{stage: "verify-failed", detail: "mandatory restriction missing from sandbox argv: " + flag}
 		}
 	}
-	if !strings.Contains(joined, "--mount type=bind,src="+root+",dst="+sandboxContainerPath) {
-		return &sandboxLaunchError{stage: "verify-failed", detail: "project root is not bind-mounted as the only writable mount"}
+	if err := verifySandboxMountClause(strings.Fields(joined), root); err != nil {
+		return &sandboxLaunchError{stage: "verify-failed", detail: err.Error()}
 	}
 	return nil
 }
