@@ -715,7 +715,13 @@ func (r *Router) Test(path string) Result {
 	}
 
 	cmd := runner.Run(abs)
-	cmd.Dir = r.Root
+	// PR-10B note: run in the file's own directory. Using r.Root with
+	// "./..." would execute every Go test package under the project root —
+	// when the agent itself runs under `go test ./...` that leaks the outer
+	// suite into the inner one (and vice versa), producing spurious failures
+	// attributed to the wrong binary. The package of the tested file is the
+	// correct scope for both *_test.go and sibling-source routing.
+	cmd.Dir = filepath.Dir(abs)
 
 	out, err := cmd.CombinedOutput()
 
