@@ -457,10 +457,20 @@ func (r *Router) Exec(command string) Result {
 		}
 	}
 
+	// SEC-2: shell-level pre-checks cannot reliably follow $var, ${var},
+	// globs or symlinks, so snapshot protected files before execution and
+	// verify integrity afterwards. This is report-only: nothing is deleted
+	// or restored here.
+	protectedSnapshot := r.snapshotProtectedFiles()
+
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
 
 	out, err := cmd.CombinedOutput()
+
+	if modified, violated := r.verifyProtectedIntegrity(protectedSnapshot); violated {
+		return protectedIntegrityFailure("exec", command, modified, string(out))
+	}
 
 	result := Result{
 		Tool:   "exec",
@@ -505,11 +515,19 @@ func (r *Router) AssertOutput(command, expected string) Result {
 		}
 	}
 
+	// SEC-2: post-execution integrity guard (see Router.Exec). Snapshot
+	// before, verify after; report-only, no automatic deletion or restore.
+	protectedSnapshot := r.snapshotProtectedFiles()
+
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
 
 	out, err := cmd.CombinedOutput()
 	actual := string(out)
+
+	if modified, violated := r.verifyProtectedIntegrity(protectedSnapshot); violated {
+		return protectedIntegrityFailure("assert_output", command, modified, actual)
+	}
 
 	if strings.HasSuffix(actual, "\r\n") {
 		actual = strings.TrimSuffix(actual, "\r\n")
