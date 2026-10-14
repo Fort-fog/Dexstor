@@ -463,6 +463,14 @@ func (r *Router) Exec(command string) Result {
 	// or restored here.
 	protectedSnapshot := r.snapshotProtectedFiles()
 
+	// PR-S1: when the sandbox toggle is on, the command runs ONLY inside a
+	// rootless Podman container. Fail-closed: if podman is missing or the
+	// container cannot start, we return FAIL and never fall back to host
+	// /bin/sh. With the toggle off, host behaviour is unchanged.
+	if sandboxEnabled() {
+		return r.execSandboxed("exec", command, protectedSnapshot)
+	}
+
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
 
@@ -518,6 +526,11 @@ func (r *Router) AssertOutput(command, expected string) Result {
 	// SEC-2: post-execution integrity guard (see Router.Exec). Snapshot
 	// before, verify after; report-only, no automatic deletion or restore.
 	protectedSnapshot := r.snapshotProtectedFiles()
+
+	// PR-S1: identical sandbox policy as Exec — fail-closed, no host fallback.
+	if sandboxEnabled() {
+		return r.assertOutputSandboxed(command, expected, protectedSnapshot)
+	}
 
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
