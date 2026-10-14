@@ -457,10 +457,50 @@ func (r *Router) Exec(command string) Result {
 		}
 	}
 
+	// SEC-2: shell-level pre-checks cannot reliably follow $var, ${var},
+	// globs or symlinks, so snapshot protected files before execution and
+	// verify integrity afterwards. This is report-only: nothing is deleted
+	// or restored here. Fail-closed: if the pre-scan itself fails we cannot
+	// certify what is protected, so the command does not run at all.
+	protectedSnapshot, snapErr := r.snapshotProtectedFiles()
+	if snapErr != nil {
+		return Result{
+			Tool:   "exec",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command was not executed", snapErr),
+			Error:  fmt.Sprintf("protected file pre-scan failed: %v", snapErr),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+
+	// PR-S1: when the sandbox toggle is on, the command runs ONLY inside a
+	// rootless Podman container. Fail-closed: if podman is missing or the
+	// container cannot start, we return FAIL and never fall back to host
+	// /bin/sh. With the toggle off, host behaviour is unchanged.
+	if sandboxEnabled() {
+		return r.execSandboxed("exec", command, protectedSnapshot)
+	}
+
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
 
 	out, err := cmd.CombinedOutput()
+
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(protectedSnapshot)
+	if verifyErr != nil {
+		// Post-scan failure must never be reported as success, even when the
+		// command exited 0 and printed PASS.
+		return Result{
+			Tool:   "exec",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command output moved to Error field", verifyErr),
+			Error:  fmt.Sprintf("post-execution protected scan failed: %v. original output follows:\n%s", verifyErr, string(out)),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+	if violated {
+		return protectedIntegrityFailure("exec", command, modified, string(out))
+	}
 
 	result := Result{
 		Tool:   "exec",
@@ -505,11 +545,44 @@ func (r *Router) AssertOutput(command, expected string) Result {
 		}
 	}
 
+	// SEC-2: post-execution integrity guard (see Router.Exec). Snapshot
+	// before, verify after; report-only, no automatic deletion or restore.
+	// Fail-closed on any scan error — see Router.Exec for the rationale.
+	protectedSnapshot, snapErr := r.snapshotProtectedFiles()
+	if snapErr != nil {
+		return Result{
+			Tool:   "assert_output",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command was not executed", snapErr),
+			Error:  fmt.Sprintf("protected file pre-scan failed: %v", snapErr),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+
+	// PR-S1: identical sandbox policy as Exec — fail-closed, no host fallback.
+	if sandboxEnabled() {
+		return r.assertOutputSandboxed(command, expected, protectedSnapshot)
+	}
+
 	cmd := exec.Command("/bin/sh", "-c", command)
 	cmd.Dir = r.Root
 
 	out, err := cmd.CombinedOutput()
 	actual := string(out)
+
+	modified, violated, verifyErr := r.verifyProtectedIntegrity(protectedSnapshot)
+	if verifyErr != nil {
+		return Result{
+			Tool:   "assert_output",
+			Output: fmt.Sprintf("SEC-2 INTEGRITY CHECK UNAVAILABLE: %v; command output moved to Error field", verifyErr),
+			Error:  fmt.Sprintf("post-execution protected scan failed: %v. original output follows:\n%s", verifyErr, actual),
+			Status: "FAIL",
+			Exit:   -1,
+		}
+	}
+	if violated {
+		return protectedIntegrityFailure("assert_output", command, modified, actual)
+	}
 
 	if strings.HasSuffix(actual, "\r\n") {
 		actual = strings.TrimSuffix(actual, "\r\n")
@@ -697,7 +770,13 @@ func (r *Router) Test(path string) Result {
 	}
 
 	cmd := runner.Run(abs)
-	cmd.Dir = r.Root
+	// PR-10B note: run in the file's own directory. Using r.Root with
+	// "./..." would execute every Go test package under the project root —
+	// when the agent itself runs under `go test ./...` that leaks the outer
+	// suite into the inner one (and vice versa), producing spurious failures
+	// attributed to the wrong binary. The package of the tested file is the
+	// correct scope for both *_test.go and sibling-source routing.
+	cmd.Dir = filepath.Dir(abs)
 
 	out, err := cmd.CombinedOutput()
 
