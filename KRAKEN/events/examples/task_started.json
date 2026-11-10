@@ -1,0 +1,9 @@
+{
+  "event": "task_started",
+  "task_id": "example-task-001",
+  "project": "destor-merge",
+  "agent": "DEXSTER",
+  "timestamp": "2026-10-13T00:00:00Z",
+  "goal": "repair source code",
+  "state": "DISCOVER"
+}
